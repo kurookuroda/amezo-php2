@@ -1,0 +1,10 @@
+trip_secret.txt
+id_secret.txt
+global.mem
+*.tmp*
+config.php
+admin_fail.mem
+__pycache__/
+key_secret.txt
+keys.txt
+*.lock
