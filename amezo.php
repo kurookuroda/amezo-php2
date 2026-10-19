@@ -140,9 +140,7 @@ function amezo_main(): void
         $ip = client_ip();
         if ($subj !== '') check_global_ip($ip);
 
-        $linked = preg_replace_callback('/(https?:[\w.~\-\/?+=:@%;#&]+)/u', 'url_link', $comm);
-        if ($linked === null) bbs_error('コメントを処理できません.');      // 正規表現の失敗で本文が消えるのを防ぐ
-        $comm = $linked;
+        $comm = linkify_urls($comm);
 
         $trip = '';
         if ($cap_ok) {

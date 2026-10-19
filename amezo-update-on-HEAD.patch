@@ -1,0 +1,716 @@
+diff --git a/.gitignore b/.gitignore
+index 9394826..dbedc45 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -8,3 +8,4 @@ __pycache__/
+ key_secret.txt
+ keys.txt
+ *.lock
++jump_secret.txt
+diff --git a/README.md b/README.md
+index 2b3595e..b37f28b 100644
+--- a/README.md
++++ b/README.md
+@@ -9,6 +9,7 @@ Python 版 (`amezo.py` / `dai.py`) の PHP 移植。スレッドは今までど
+ | `lib.php` | 共通部品 (エスケープ、文字数、鍵、トリップ、ID、ハッシュ、index 再生成、過去ログ) |
+ | `amezo.php` | 投稿の受付 (`/amezo.cgi` もここに向く) |
+ | `dai.php` | 板一覧 (`/dai.cgi` もここに向く) |
++| `jump.php` | 外部サイトへの中継ページ (`/jump.cgi` もここに向く)。署名つきの URL だけを表示する |
+ | `admin.php` | 管理画面 (`/admin.cgi` もここに向く): レス削除、スレッドの非表示・復元 |
+ | `router.php` | `php -S` 用。許可リスト方式で静的ファイルを配る |
+ | `hide.js` | ID / トリップの非表示 (ブラウザの localStorage だけで動く) |
+@@ -63,6 +64,48 @@ sh run.sh                 # http://127.0.0.1:8000/
+ - 文字列の連結 (`.=`) を配列 + `implode` に変えても、メモリは減らない (20万片で 9.0MB → 16.0MB)。`regen_index` は文字列に溜めず、`fwrite` で書き出している。
+ - cloudflared のメモリは測っていない。
+ 
++## セキュリティ (webshell 対策)
++
++webshell = 攻撃者が置いた(または書き込ませた) PHP を、あとから実行される形で残すこと。このアプリでは、次の層で防いでいる。
++
++**1. 置かせない (入口)**
++- ファイルのアップロード機能が無い。`eval` `system` `exec` `unserialize` `include` (変数のパス) など、コード実行につながる関数をアプリ本体で使っていない (走査で確認)。
++- ファイルを書く・消す・名前を変える操作のパスは、`blist.txt` に載っている板名、数字だけのスレッド番号、定数だけから作る。攻撃者が名前を選べる書き込みは無い。
++- 投稿の全フィールド (名前・メール・題名・本文) は、保存前にエスケープする。`<?php` `<?=` `<%` `<script language="php">` は文字になる (`.html` を PHP として処理する設定ミスがあっても実行されない)。
++
++**2. 置かれても実行させない・秘密を配らない (配信の入口: `router.php`)**
++- 実行するのは `/amezo` `/dai` `/admin` `/jump` の `.cgi` / `.php` だけ。静的ファイルは許可リスト (`index.html` `数字.html` `o数字.html` `kako.html` `style.css` `hide.js` `ad.html`) だけ。ほかは 404。
++- 板フォルダに `shell.php` `.phtml` `.php5` `.phar` `.htaccess` を置かれても 404。許可リストの `.html` に PHP のコードが入っていても、文字のまま返る (実行されない)。
++- **`//` で許可リストをすり抜けられる不具合を直した (旧 router)**: `parse_url('//delpass.txt')` は「ホスト名 delpass.txt」と読んでパスが null になり、router は `/` (許可リスト内) と判断して `return false` するのに、
++  組み込みサーバーは生の `//delpass.txt` を実際のファイルとして開いていた。**アプリのフォルダ直下の全部のファイルが対象だった**: `delpass.txt`、`trip_secret.txt` `id_secret.txt` `key_secret.txt` `jump_secret.txt`、`cap.txt` `ng.txt` `blist.txt` などがそのまま読め、`.php` は実行もされた
++  (板フォルダの中 (`//adm/keys.txt` など) は影響なし)。旧 router を、外から届く形で動かしていたなら、これらを読まれた可能性がある。管理用パスワード・キャップのパスワード・各 `*_secret.txt` を作り直すこと (作り直すと、トリップ・ID・中継リンク・発行済みの認証キーは変わる、または使えなくなる)。
++  いまは `parse_url` を使わず、`//`、`%`、`\`、`.` `..` の区間、NUL、`/` で始まらない形 (`http://…`) を 400 で止める。本来の経路は、どれもこれらを使わない。
++  `tests/webshell_test.py` が、この種の経路と、秘密ファイル (`//delpass.txt` `//trip_secret.txt` など) を毎回確かめる。
++- `%` を含むパスは 400 になる。**板のフォルダ名は ASCII にすること** (非 ASCII の名前は、ブラウザが `%E6…` に変換するため開けなくなる)。板のタイトル (`blist.txt` の3列目) は日本語でよい。
++
++**3. 実行されても被害を小さくする (PHP の起動オプション)**
++`php -S` の起動に、次を付けても、サーバーを使う結合テスト (`jump_test.py` `lock_test.py` `webshell_test.py`) が通ることを確認した。コードを実行できた攻撃者が、コマンド実行・外への接続・アプリの外のファイルの読み書きをできなくなる。
++
++```
++php -n -d extension=<mbstring.so> -d extension=<ctype.so> -d memory_limit=32M -d expose_php=0 \
++    -d allow_url_fopen=0 -d allow_url_include=0 -d open_basedir=<アプリのフォルダ>:/tmp \
++    -d disable_functions=exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec,dl,mail,show_source,highlight_file,phpinfo,\
++posix_kill,posix_setuid,posix_setgid,posix_mkfifo,symlink,link,putenv,fsockopen,pfsockopen,stream_socket_client,\
++stream_socket_server,stream_socket_pair,socket_create,socket_create_listen,curl_exec,curl_multi_exec,proc_nice,proc_terminate,proc_get_status \
++    -S 127.0.0.1:8000 router.php
++```
++
++(`setup_expose.py` の既定にはまだ入れていない。`setup_expose.py` が PHP を起動するのは Python の `subprocess` なので、`disable_functions` の影響は受けない。)
++
++**4. 見つける・気づく**
++- 板フォルダに置かれるファイル名は決まっている (`数字.html`、`x数字.html`、`o数字.html`、`数字.lock`、`index数字.html`、`kako.html`、`kako.txt`、`keys.txt`、`keys.lock`、`lasttime.txt`、`regen.lock`)。これ以外のファイルがあれば異常。
++  板の `.html` / `.txt` に生の `<?` や `<%` があれば異常 (エスケープ済みなので、正常なら入らない)。コードのハッシュを控えておけば、書き換えも分かる。
++
++**まだ弱いところ**
++- `lib.php` は、`config.php` があれば自動で `require` する。アプリのフォルダは PHP が書き込める場所なので、将来、書き込みの穴が見つかったときに、そのまま常駐の足がかりになる。設定を PHP ファイルでなく、実行されない形式 (ini / JSON) にするのが望ましい。
++- Colab では PHP が root で動き、コードと同じフォルダに鍵やデータが書かれる。コードを読み取り専用にする、データのフォルダを分ける、非 root で動かす、Google ドライブを同じランタイムにマウントしない、が望ましい。
++- `setup_expose.py` が取得する `cloudflared` は、チェックサムを確かめていない。
++
+ ## 設定
+ 
+ `config.php` (任意。`.gitignore` 済み) に `define('POST_INTERVAL', 3);` のように書くと、`lib.php` 冒頭の既定値を上書きできる。
+@@ -85,6 +128,27 @@ php amezo.php --make-hash 'パスワード' > delpass.txt     # 管理用パス
+ - レス一覧に ID の列を足してある (荒らしの見分け用)。
+ - スレッドごとの鍵 (認証キー) の管理は、次の「鍵つきスレッド」を参照。
+ 
++## 外部リンクの中継ページ
++
++投稿された URL は、直接ではなく中継ページを経由するリンクになる。「このリンク先へ行きますか?」と確認させるためのページで、広告枠を置ける。
++
++```
++スレッド HTML:  <a href="../jump.cgi?u=<URL (base64url)>&s=<署名>">元の URL の文字</a>
++  → 中継ページ: 移動先のホスト名 + URL 全体を文字で表示 + 「進む」「戻る」(自動では転送しない)
++  → 「進む」を押したときだけ、外部サイトへ
++```
++
++- **署名つき**: `s` は `HMAC-SHA256(jump_secret.txt の鍵, 'jump:' + URL)` の先頭132bit。署名が合うもの (= この掲示板に実際に投稿された URL) だけを表示する。
++  署名がなければ「どんな URL へも飛ばせる踏み台」になり、フィッシングに使われる。`u` や `s` を1文字変えても、別の URL に替えても、ランダムな署名でも通らない (テストで確認)。
++- **署名の鍵は、作り直さない**: `jump_secret.txt` を失うと、投稿済みの中継リンクが全部開けなくなる (トリップや ID の鍵より重い)。バックアップに入れること。
++  署名が合わないときは、「進む」を出さず、URL を文字だけで見せる (クリックできるリンクにはしない)。
++- **中継ページの安全対策**: `http` / `https` で、ホスト名が英数字で始まる ASCII の URL だけ (2000文字まで)。`xn--` を含むドメインには注意を出す。
++  `noindex`、`no-referrer`、`no-store`、CSP (nonce つきのスクリプトだけ、他サイトに埋め込めない)。
++- **広告枠**: `ad.html` を置くと、中継ページに「広告」ラベルつきの iframe で出る。`sandbox="allow-scripts allow-popups"` (`allow-same-origin` なし) なので、広告のコードは掲示板のデータに触れない。
++  `ad.html` が無ければ何も出ない。広告サービスの規約 (中継ページへの設置など) は、使う前に確認すること。
++- 直リンクに戻すときは、`config.php` に `define('JUMP_ENABLED', false);`。
++- 既存のスレッド (中継を入れる前の投稿) の直リンクは、書き換えていない。
++
+ ## 鍵つきスレッド (認証キー)
+ 
+ スレッドを「認証キーがないと書き込めない」にできる。読むのは誰でもできる。**既定は鍵なし**で、管理者があとからでも鍵をかけられる。
+@@ -126,6 +190,10 @@ php amezo.php --make-hash 'パスワード' > delpass.txt     # 管理用パス
+   - リンクは `amezo.cgi?folder=板&page=3` (GET)。押すと、そのページのファイルが新しければそのまま、古ければ (10秒) 作り直して `index3.html` へ転送する。範囲外の番号は最後のページになる。
+   - 同じページは誰が頼んでも同じ内容なので、共有の `index2.html` のような上書きの取り違えは起きない。フォーム送信ではないので「再送信しますか」も出ない。10分たったファイルは掃除する。
+   - 「◯番目から」の細かい位置指定はできない (20件区切り)。古い index に残っている `next=N` の欄は、そのページに読み替えて受ける。
++- **投稿された URL は、署名つきの中継ページ (`/jump.cgi`) 経由のリンクになる** (下の「外部リンクの中継ページ」)。新規の投稿だけが対象で、既存のスレッドの直リンクはそのまま。
++- 本文の URL のリンク化 (`linkify_urls()`) を作り直した。URL とみなすのは、`http://` か `https://` で始まり、ホスト名が英数字で始まり、URL に使える **ASCII の文字だけ** (と、エスケープされた `&amp;` `&#39;`)。
++  直後の日本語 (`http://example.com見てね`)、`<…>` や `"…"` の閉じ側、末尾の `.` `,` `!` `?`、対応のない `)` `]`、末尾の `(` は URL に含めない。`http:evil` や `javascript:` はリンクにしない。
++  href はエスケープを戻してから属性用にエスケープし直す (`&` は `&amp;`)。デコード済みの日本語を含む URL (`/wiki/PHP_(言語)` など) は、最初の日本語で切れる (アドレスバーからコピーした `%E6…` の形ならそのまま通る)。
+ - `AMEZO-NEXT` のコメントは出さない。
+ - 投稿行に `data-id` / `data-trip` と `ID:xxxxxxxx` が入る。新しいスレッドと index には `hide.js` を読む `<script>` が入る (既存スレッドには入らない)。
+ - スレッドの末尾だけを読むので、レス数が増えても投稿・再生成のメモリは増えない。管理画面も1行ずつ読んで出す (5000レスのスレッドでも `memory_limit=3M` で動く)。
+@@ -133,8 +201,10 @@ php amezo.php --make-hash 'パスワード' > delpass.txt     # 管理用パス
+ 
+ ## 検証した内容
+ 
+-- `tests/unit.php`: Python 版が出した値 (トリップ、文字数、切り詰め、エスケープ、不可視文字、pbkdf2 ハッシュ) と、ID・ページ送り・認証キー (生成、正規化、範囲、失効) を合わせた 147 項目が一致。
++- `tests/unit.php`: Python 版が出した値 (トリップ、文字数、切り詰め、エスケープ、不可視文字、pbkdf2 ハッシュ) と、ID・ページ送り・認証キー (生成、正規化、範囲、失効)・URL のリンク化 (26通り)・中継リンクの署名 (改ざん、往復、秘密鍵の分離) を合わせた項目が、すべて一致 (件数は実行結果の末尾に出る)。
+ - `tests/e2e.sh` + `tests/cmp.py`: 同じ投稿 25 通りを Python 版と PHP 版に流し、エラー文言と生成 HTML (スレッド・index・過去ログ) が一致 (日時・ID・番号などは正規化)。
++- `tests/webshell_test.py`: 実行できる形の PHP や、秘密ファイルを置かれたと仮定して、`//x.php` `//delpass.txt` `%2e%2e` `\` 絶対形式などの経路が、実行・配信されない (404/400、静的 `.html` は文字のまま) こと、本来の経路が動くことを確認。
++- `tests/jump_test.py`: 中継ページ (リンクの形、署名の検証、改ざん・ランダムな署名・壊れた入力が通らないこと、鍵を失った場合、広告枠、`res_view` の相対パス、配信) を確認。
+ - `tests/lock_test.py` と `tests/lock_retire.php`: 鍵つきスレッド (鍵をかける前後の発行、書き込みの可否、範囲、失効、鍵を外す、フォームの差し替え、配信されないこと、同時のかけ外し、退避時の `.lock`) を確認。
+ - `tests/pager.sh` と `tests/unit.php`: ページ送り (実在するページだけ、範囲外は最後のページ、前へ/次への出し分け、1ページの板では出さない、11ページ以上の省略表示、ファイル数) を確認。
+ - 同時投稿 60 件 → 61 レスが欠けずに連番、返信フォームは1つ。
+@@ -145,6 +215,7 @@ php amezo.php --make-hash 'パスワード' > delpass.txt     # 管理用パス
+ 
+ ## まだ無いもの / 未確認
+ 
++- 既存スレッドの直リンクを中継リンクに書き換える処理 (サーバー側の一括スクリプト。ブラウザ側では署名が作れないので不可)。広告の中身。
+ - 鍵つきスレッドで、スレを立てた人が自分でキーを発行する機能 (今は管理者だけ)。書き込みにキーのラベルを表示する機能。
+ - 既存スレッドに `hide.js` を入れる処理 (新しいスレッドと index にだけ入る)。
+ - `>>数字` のアンカーと連鎖あぼーん (今は `>>` を `>` に畳む仕様)。
+diff --git a/amezo.php b/amezo.php
+index 7b3ebcb..a1326b6 100644
+--- a/amezo.php
++++ b/amezo.php
+@@ -140,9 +140,7 @@ function amezo_main(): void
+         $ip = client_ip();
+         if ($subj !== '') check_global_ip($ip);
+ 
+-        $linked = preg_replace_callback('/(https?:[\w.~\-\/?+=:@%;#&]+)/u', 'url_link', $comm);
+-        if ($linked === null) bbs_error('コメントを処理できません.');      // 正規表現の失敗で本文が消えるのを防ぐ
+-        $comm = $linked;
++        $comm = linkify_urls($comm);
+ 
+         $trip = '';
+         if ($cap_ok) {
+diff --git a/jump.php b/jump.php
+new file mode 100644
+index 0000000..50ee530
+--- /dev/null
++++ b/jump.php
+@@ -0,0 +1,93 @@
++<?php
++declare(strict_types=1);
++//
++// jump.php - 外部サイトへの中継ページ (/jump.cgi も、ここに向く)
++//
++//   投稿された URL へのリンクは、このページを経由する: /jump.cgi?u=<URL (base64url)>&s=<署名>
++//   署名が合うもの (= この掲示板に実際に投稿された URL) だけを表示する。署名がなければ、
++//   このページは「どんな URL へも飛ばせる踏み台」になってしまい、フィッシングに悪用される。
++//   自動では転送しない。飛び先を文字で全部見せて、「進む」を押したときだけ外へ出る。
++//
++require __DIR__ . '/lib.php';
++
++function jump_headers(string $nonce): void
++{
++    header('Content-Type: text/html; charset=UTF-8');
++    header('Cache-Control: no-store');
++    header('X-Robots-Tag: noindex, nofollow');
++    header('Referrer-Policy: no-referrer');
++    header('X-Content-Type-Options: nosniff');
++    header("Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-{$nonce}'; "
++         . "frame-src 'self'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'");
++}
++
++function jump_page(string $title, string $body, string $nonce, bool $with_back = true): never
++{
++    jump_headers($nonce);
++    echo '<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8">'
++        . '<meta name="viewport" content="width=device-width, initial-scale=1">'
++        . '<meta name="robots" content="noindex, nofollow"><meta name="referrer" content="no-referrer">'
++        . '<title>' . htmlspecialchars($title, ENT_QUOTES, 'UTF-8') . '</title>'
++        . '<style>:root{color-scheme:light dark}body{font-family:sans-serif;max-width:40em;margin:1.5em auto;padding:0 1em;line-height:1.6}'
++        . '.url{word-break:break-all;border:1px solid #888;padding:.6em .8em;margin:.8em 0;font-family:monospace}'
++        . '.host{font-size:1.4em;font-weight:bold;word-break:break-all}'
++        . '.btns{margin:1.2em 0}.go,.back{display:inline-block;padding:.5em 1.6em;margin-right:.8em;border:1px solid #888;border-radius:6px;'
++        . 'font-size:1em;text-decoration:none;cursor:pointer;background:transparent;color:inherit}.go{font-weight:bold}'
++        . '.note{font-size:.9em;opacity:.85}.warn{border:1px solid #c60;padding:.4em .7em;margin:.6em 0}'
++        . '.ad{margin:1.5em 0}.ad small{display:block;opacity:.7}.ad iframe{width:100%;height:260px;border:1px solid #888}</style>'
++        . '</head><body><h2>' . htmlspecialchars($title, ENT_QUOTES, 'UTF-8') . '</h2>' . $body;
++    if ($with_back) {
++        echo '<script nonce="' . $nonce . '">document.getElementById("back").addEventListener("click",function(){'
++           . 'if(history.length>1){history.back();}else{window.close();}});</script>';
++    }
++    echo '</body></html>';
++    exit;
++}
++
++function jump_main(): void
++{
++    $nonce = bin2hex(random_bytes(12));
++    $u = is_string($_GET['u'] ?? null) ? $_GET['u'] : '';
++    $s = is_string($_GET['s'] ?? null) ? $_GET['s'] : '';
++    $url = strlen($u) <= 3000 ? b64url_decode($u) : null;
++
++    if ($url === null || !jump_verify($url, $s)) {
++        // 署名が合わない: リンクにはしない。URL として読めるなら、文字だけ見せる (自分で確かめてから開けるように)
++        $body = '<p>このリンクは、署名が合わないため、自動では開きません。<br>'
++              . '掲示板に投稿された URL ではないか、投稿のあとに署名の鍵が変わった可能性があります。</p>';
++        if ($url !== null && url_is_valid($url)) {
++            $body .= '<p class="note">URL (リンクにはしていません。確かめてから、自分で開いてください):</p>'
++                   . '<div class="url">' . htmlspecialchars($url, ENT_QUOTES, 'UTF-8') . '</div>';
++        }
++        $body .= '<div class="btns"><button type="button" class="back" id="back">戻る</button></div>';
++        jump_page('このリンクは使えません', $body, $nonce);
++    }
++
++    $host = parse_url($url, PHP_URL_HOST);
++    if (!is_string($host) || $host === '') $host = '(ホスト名を読み取れません)';
++    $e = static fn(string $x): string => htmlspecialchars($x, ENT_QUOTES, 'UTF-8');
++
++    $body = '<p>この掲示板に投稿された、外部サイトへのリンクです。移動先を確かめてから、「進む」を押してください。</p>'
++          . '<p class="note">移動先のサイト</p><div class="host">' . $e($host) . '</div>'
++          . '<p class="note">URL 全体</p><div class="url">' . $e($url) . '</div>';
++    if (stripos($host, 'xn--') !== false) {
++        $body .= '<div class="warn">ドメイン名に <code>xn--</code> が含まれています。見た目が似た別のサイトのことがあるので、特に注意してください。</div>';
++    }
++    $body .= '<div class="btns"><a class="go" href="' . $e($url) . '" rel="noopener noreferrer nofollow" referrerpolicy="no-referrer">進む</a>'
++           . '<button type="button" class="back" id="back">戻る</button></div>'
++           . '<p class="note">このページは自動では転送しません。リンク先の内容について、掲示板は責任を負いません。</p>';
++    // 広告枠: ad.html があるときだけ。別オリジン扱い (allow-same-origin なし) の iframe に入れて、掲示板のデータに触れさせない
++    if (is_file(__DIR__ . '/ad.html')) {
++        $body .= '<div class="ad"><small>広告</small>'
++               . '<iframe src="ad.html" sandbox="allow-scripts allow-popups" referrerpolicy="no-referrer" loading="lazy" title="広告"></iframe></div>';
++    }
++    jump_page('外部サイトへ移動します', $body, $nonce);
++}
++
++try {
++    jump_main();
++} catch (RuntimeException $e) {
++    error_log('jump: ' . $e->getMessage());
++    http_response_code(500);
++    echo 'サーバーの設定に問題があります。';
++}
+diff --git a/lib.php b/lib.php
+index d24a4f0..372cc52 100644
+--- a/lib.php
++++ b/lib.php
+@@ -37,6 +37,7 @@ foreach ([
+     'COMM_LINES_MAX'  => 20,
+     'HASH_ITERATIONS' => 100000,
+     'TRUSTED_PROXIES' => ['127.0.0.1', '::1'],
++    'JUMP_ENABLED'    => true,     // 投稿の URL を、署名つきの中継ページ (jump.cgi) 経由のリンクにする (false なら直リンク)
+ ] as $k => $v) {
+     defined($k) || define($k, $v);
+ }
+@@ -67,6 +68,12 @@ const KEY_CTX         = 'key:';             // 公開後に変えない
+ const KEYS_FILE       = 'keys.txt';         // 板ごと: <板>/keys.txt
+ const KEY_ALPHABET    = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+ 
++// ---- 中継ページ (jump.php): 投稿の URL への署名つきリンク ----
++const JUMP_SECRET_FILE = 'jump_secret.txt'; // 署名用の秘密鍵 (他の鍵とは別)。失うと、投稿済みの中継リンクが全部使えなくなる
++const JUMP_CTX         = 'jump:';           // 公開後に変えない
++const JUMP_SIG_LEN     = 22;                // 署名の長さ (base64url で22文字 = 132bit)
++const URL_MAX_LEN      = 2000;
++
+ const SCRIPT_TAG = '<script src="../hide.js" defer></script>';
+ const COPYRIGHT  = "<!--\n    Script for amezo-like BBS (PHP Version)\n    Original Copyright (C) 1999-2003 amezo_\n    http://www17.big.or.jp/~amezo_/\n    http://ame.x0.com/\n-->\n";
+ const ENTITY_TOKEN_RE = '/&(?:amp|quot|lt|gt|#39);|./su';
+@@ -351,11 +358,79 @@ function redirect(string $folder, string $index_name): never
+     exit;
+ }
+ 
+-function url_link(array $m): string
++function b64url_encode(string $bin): string
++{
++    return rtrim(strtr(base64_encode($bin), '+/', '-_'), '=');
++}
++
++function b64url_decode(string $s): ?string
++{
++    if ($s === '' || !preg_match('/^[A-Za-z0-9_-]+$/D', $s)) return null;
++    $d = base64_decode(strtr($s, '-_', '+/'), true);
++    return $d === false ? null : $d;
++}
++
++/** 中継ページに渡してよい URL か (http/https、ホスト名は英数字か [ で始まる、使える文字は ASCII の URL 文字だけ) */
++function url_is_valid(string $url): bool
++{
++    if ($url === '' || strlen($url) > URL_MAX_LEN) return false;
++    return (bool)preg_match('/^https?:\/\/[A-Za-z0-9\[][A-Za-z0-9\-._~:\/?#\[\]@!$*+,;=%()\'&]*$/D', $url);
++}
++
++/** URL の署名: HMAC-SHA256(中継用の秘密鍵, 'jump:' + URL) の先頭132bit */
++function jump_sign(string $url): string
+ {
+-    $dsp = $m[1];
+-    $url = str_replace('&amp;', '&', $dsp);
+-    return '<a href="' . $url . '" target="_blank" rel="noopener noreferrer nofollow">' . $dsp . '</a>';
++    return substr(b64url_encode(hash_hmac('sha256', JUMP_CTX . $url, load_secret(JUMP_SECRET_FILE), true)), 0, JUMP_SIG_LEN);
++}
++
++function jump_verify(string $url, string $sig): bool
++{
++    return url_is_valid($url) && hash_equals(jump_sign($url), $sig);
++}
++
++/** スレッド HTML に書く中継リンクの href (属性用にエスケープ済み。板のフォルダの中から見た相対パス) */
++function jump_href(string $url): string
++{
++    return '../jump.cgi?u=' . b64url_encode($url) . '&amp;s=' . jump_sign($url);
++}
++
++/**
++ * エスケープ済みの本文から URL を探して、リンクにする。
++ *  - URL に使える ASCII の文字と、エスケープされた &amp; &#39; だけを URL とみなす
++ *    (直後の日本語、&gt; &quot; などのエスケープ、<br> は URL に含めない)
++ *  - 末尾の . , ; : ! ? ( と、対応のない ) ] は URL に含めない
++ *  - http:// か https:// で始まり、ホスト名の最初が英数字 (または [ ) のものだけ
++ * $jump (既定は JUMP_ENABLED) が true なら、リンク先は署名つきの中継ページ。表示する文字は元の URL のまま。
++ * false なら直リンク。href はエスケープを戻してから属性用に正しくエスケープし直す (生の & を入れない)。
++ */
++function linkify_urls(string $escaped, ?bool $jump = null): string
++{
++    $jump ??= JUMP_ENABLED;
++    return (string)preg_replace_callback(
++        '/https?:\/\/(?:[A-Za-z0-9\-._~:\/?#\[\]@!$*+,;=%()]|&amp;|&#39;)+/',
++        static function (array $m) use ($jump): string {
++            $dsp = $m[0];
++            $tail = '';
++            while ($dsp !== '') {
++                if (str_ends_with($dsp, '&amp;') || str_ends_with($dsp, '&#39;')) {
++                    $cut = 5;
++                } else {
++                    $c = $dsp[strlen($dsp) - 1];
++                    if (str_contains('.,;:!?(', $c)) $cut = 1;
++                    elseif ($c === ')' && substr_count($dsp, ')') > substr_count($dsp, '(')) $cut = 1;
++                    elseif ($c === ']' && substr_count($dsp, ']') > substr_count($dsp, '[')) $cut = 1;
++                    else break;
++                }
++                $tail = substr($dsp, -$cut) . $tail;
++                $dsp = substr($dsp, 0, -$cut);
++            }
++            $url = str_replace(['&amp;', '&#39;'], ['&', "'"], $dsp);
++            if (!url_is_valid($url)) return $m[0];
++            $href = $jump ? jump_href($url) : html_escape($url);
++            return '<a href="' . $href . '" target="_blank" rel="noopener noreferrer nofollow">' . $dsp . '</a>' . $tail;
++        },
++        $escaped
++    );
+ }
+ 
+ /** レス用フォーム (1行で返す。スレッドファイルのパーサが行単位のため)。鍵つきスレッドは認証キーの欄が付く */
+@@ -588,18 +663,19 @@ function res_view(string $folder, array $form): never
+ 
+     header('Content-Type: text/html; charset=UTF-8');
+     while (($line = fgets($fp)) !== false) {
+-        echo str_replace(['href="../style.css"', 'src="../hide.js"'], ['href="style.css"', 'src="hide.js"'], $line);
++        echo str_replace(['href="../style.css"', 'src="../hide.js"', 'href="../jump.cgi?'], ['href="style.css"', 'src="hide.js"', 'href="jump.cgi?'], $line);
+         if (str_contains($line, '<dl>') || str_contains($line, '<dt>')) break;
+     }
+     $fol_tag = '<input type="hidden" name="folder" value="' . htmlspecialchars($folder, ENT_QUOTES, 'UTF-8') . '">';
+     // 返信フォームの行は、action を板のない位置に直し、folder を足して出す
+     $form_line = static fn(string $l): string => str_replace('</form>', $fol_tag . '</form>', str_replace('action="../', 'action="', $l));
++    $fixj = static fn(string $l): string => str_contains($l, '../jump.cgi?') ? str_replace('href="../jump.cgi?', 'href="jump.cgi?', $l) : $l;   // / 直下から出力するので、中継リンクの相対パスを直す
+     $matched = false;
+     $footer = null;
+     while (($line = fgets($fp)) !== false) {
+         if (str_starts_with($line, '<form')) $footer = $line;
+         if (preg_match('/<dt>(\d+)/', $line, $m) && (int)$m[1] >= $from) {
+-            echo $line;
++            echo $fixj($line);
+             $matched = true;
+             break;
+         }
+@@ -608,7 +684,7 @@ function res_view(string $folder, array $form): never
+         echo $form_line($footer);
+     }
+     while (($line = fgets($fp)) !== false) {
+-        echo str_contains($line, '</form>') ? $form_line($line) : $line;
++        echo str_contains($line, '</form>') ? $form_line($line) : $fixj($line);
+     }
+     fclose($fp);
+     exit;
+diff --git a/router.php b/router.php
+index baf887a..5796944 100644
+--- a/router.php
++++ b/router.php
+@@ -5,14 +5,17 @@
+ //
+ //   PHP_CLI_SERVER_WORKERS=2 php -S 127.0.0.1:8000 router.php
+ //
+-$path = rawurldecode(parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/');
+-if (str_contains($path, "\0") || str_contains($path, '..') || str_contains($path, '\\')) {
++// REQUEST_URI の「?」より前を、そのまま使う。parse_url() は使わない。
++$path = (string)($_SERVER['REQUEST_URI'] ?? '/');
++if (($q = strpos($path, '?')) !== false) $path = substr($path, 0, $q);
++if ($path === '' || $path[0] !== '/' || str_contains($path, '//') || str_contains($path, '%') || str_contains($path, '\\')
++    || str_contains($path, "\0") || str_contains($path, '..') || preg_match('~(?:^|/)\.(?:/|$)~', $path)) {
+     http_response_code(400);
+     return true;
+ }
+ 
+ // ---- CGI 相当 (amezo.cgi / amezo.php など) ----------------------------------
+-if (preg_match('~^/(amezo|dai|admin)\.(?:cgi|php)$~', $path, $m)) {
++if (preg_match('~^/(amezo|dai|admin|jump)\.(?:cgi|php)$~', $path, $m)) {
+     $f = __DIR__ . "/{$m[1]}.php";
+     if (is_file($f)) {
+         require $f;
+@@ -24,7 +27,7 @@ if (preg_match('~^/(amezo|dai|admin)\.(?:cgi|php)$~', $path, $m)) {
+ }
+ 
+ // ---- 静的ファイル (許可リスト) -------------------------------------------------
+-if (in_array($path, ['/', '/index.html', '/style.css', '/hide.js'], true)) {
++if (in_array($path, ['/', '/index.html', '/style.css', '/hide.js', '/ad.html'], true)) {
+     return false;
+ }
+ 
+diff --git a/setup_expose.py b/setup_expose.py
+index 0a754ac..876f3c5 100644
+--- a/setup_expose.py
++++ b/setup_expose.py
+@@ -177,7 +177,7 @@ def check_flock():
+ 
+ def setup_bbs_directories():
+     print("📂 BBS用のディレクトリを確認しています...")
+-    for needed in ["router.php", "lib.php", "amezo.php", "dai.php", "admin.php", "hide.js",
++    for needed in ["router.php", "lib.php", "amezo.php", "dai.php", "admin.php", "jump.php", "hide.js",
+                    "index.html", "style.css", "header.html", "blist.txt"]:
+         if not os.path.exists(needed):
+             print(f"  ⚠️ {needed} が見つかりません")
+@@ -267,9 +267,10 @@ def self_check(port):
+     """起動直後の確認: 板一覧は出る / 鍵やパスワードや PHP のソースは配られない"""
+     print("🔎 起動チェック:")
+     good = True
+-    for path, want in [("/dai.cgi", 200), ("/style.css", 200), ("/hide.js", 200),
++    for path, want in [("/dai.cgi", 200), ("/jump.cgi", 200), ("/style.css", 200), ("/hide.js", 200),
+                        ("/trip_secret.txt", 404), ("/id_secret.txt", 404), ("/delpass.txt", 404),
+-                       ("/cap.txt", 404), ("/lib.php", 404), ("/blist.txt", 404)]:
++                       ("/cap.txt", 404), ("/lib.php", 404), ("/blist.txt", 404),
++                       ("/key_secret.txt", 404), ("/jump_secret.txt", 404)]:
+         got = http_status(port, path)
+         mark = "✅" if got == want else "❌"
+         if got != want:
+diff --git a/tests/cmp.py b/tests/cmp.py
+index 3990384..f6d4a2a 100644
+--- a/tests/cmp.py
++++ b/tests/cmp.py
+@@ -1,4 +1,4 @@
+-import re, sys, glob, os, difflib
++import re, sys, glob, os, difflib, base64, html, urllib.parse
+ def norm(t):
+     t = re.sub(r'20\d\d年\d\d月\d\d日\([日月火水木金土]\)\d\d時\d\d分\d\d秒', 'DATE', t)
+     t = re.sub(r'<font size=-1 class="meta" data-id="[^"]*"(?: data-trip="[^"]*")?>', '<font size=-1>', t)
+@@ -6,6 +6,12 @@ def norm(t):
+     t = t.replace('<script src="../hide.js" defer></script>', '')
+     t = re.sub(r'\d{12}', 'TID', t)
+     t = re.sub(r'\((?:Python|PHP) Version\)', '(X Version)', t)
++    def _jump(m):   # PHP 版の中継リンクは、u を戻した元の URL に直してから比べる
++        q = urllib.parse.parse_qs(urllib.parse.urlparse(html.unescape(m.group(1))).query)
++        u = q['u'][0]
++        return 'href="' + base64.urlsafe_b64decode(u + '=' * (-len(u) % 4)).decode() + '"'
++    t = re.sub(r'href="(\.\./jump\.cgi\?[^"]*)"', _jump, t)
++    t = re.sub(r'href="([^"]*)"', lambda m: 'href="' + m.group(1).replace('&amp;', '&') + '"', t)   # URL の & の書き方の違い (PHP版は属性として正しくエスケープする)
+     t = re.sub(r'<!-- AMEZO-NEXT \d+ -->\n', '', t)      # PHP 版では出さない (ページごとに別ファイルにしたため)
+     # Python 版の「次のページ」入力欄は、PHP 版ではページ送り (pager) に置き換えた
+     t = re.sub(r'<form method=post action="../amezo.cgi">\n<input type=submit value="次のページ">\n<input type=text name="next" value="\d+" size="3">〜</form>\n', '', t)
+diff --git a/tests/jump_test.py b/tests/jump_test.py
+new file mode 100644
+index 0000000..b22de7e
+--- /dev/null
++++ b/tests/jump_test.py
+@@ -0,0 +1,108 @@
++# 中継ページ (jump.php) の結合テスト (PHP 版だけ)。前提は lock_test.py と同じ
++import base64, os, random, re, shutil, sys, time, html, urllib.request, urllib.parse, urllib.error
++PH, URL = '/tmp/phpt', 'http://127.0.0.1:8123'
++bad = 0
++def ok(label, cond, extra=''):
++    global bad
++    if not cond: bad += 1
++    print(('OK   ' if cond else 'NG   ') + label + (('  ' + extra) if extra else ''))
++class NoRedirect(urllib.request.HTTPRedirectHandler):
++    def redirect_request(self, *a, **k): return None
++OP = urllib.request.build_opener(NoRedirect)
++def get(path, body=None, ip='9.9.9.9'):
++    r = urllib.request.Request(URL + path, data=body.encode() if body is not None else None, headers={'CF-Connecting-IP': ip})
++    try:
++        with OP.open(r) as f: return f.status, f.headers, f.read().decode('utf-8', 'replace')
++    except urllib.error.HTTPError as e: return e.code, e.headers, e.read().decode('utf-8', 'replace')
++def q(**kw): return urllib.parse.urlencode(kw)
++ctr = [0]
++def ip(): ctr[0] += 1; return f'11.{ctr[0] // 250}.{ctr[0] % 250}.9'
++def post(res, name, comm, subj=None):
++    d = dict(folder='adm', name=name, comm=comm)
++    if res: d['res'] = res
++    if subj: d['subj'] = subj
++    c, h, t = get('/amezo.cgi', q(**d), ip())
++    m = re.search(r'<h2>(.*?)</h2>', t); return c, (m.group(1) if m else '')
++def b64u(s): return base64.urlsafe_b64encode(s.encode()).decode().rstrip('=')
++def jump(u, s): return get('/jump.cgi?' + q(u=u, s=s))
++
++for f in os.listdir(f'{PH}/adm'): os.unlink(f'{PH}/adm/{f}')
++if os.path.exists(f'{PH}/global.mem'): os.unlink(f'{PH}/global.mem')
++if os.path.exists(f'{PH}/ad.html'): os.unlink(f'{PH}/ad.html')
++
++U1 = 'https://example.com/a?x=1&y=2'
++post(None, 'owner', f'見て {U1} だよ。https://xn--n3h.example/ もある', subj='jump test'); time.sleep(1.1)
++T = sorted(f[:-5] for f in os.listdir(f'{PH}/adm') if re.fullmatch(r'\d{12}\.html', f))[-1]
++f = open(f'{PH}/adm/{T}.html', encoding='utf-8').read()
++links = re.findall(r'<a href="(\.\./jump\.cgi\?u=([A-Za-z0-9_-]+)&amp;s=([A-Za-z0-9_-]{22}))" target="_blank" rel="noopener noreferrer nofollow">([^<]*)</a>', f)
++ok('スレッドの URL が中継リンクになった (2件)', len(links) == 2, str(len(links)))
++ok('リンクの表示文字は元の URL (&amp; はエスケープ)', links[0][3] == 'https://example.com/a?x=1&amp;y=2', links[0][3])
++ok('href に直接の飛び先 URL が入っていない', 'href="https://' not in f and 'example.com' not in links[0][0])
++ok('URL の直後の日本語は含まない', links[0][3].endswith('y=2') and '</a> だよ。' in f)
++u1, s1 = links[0][1], links[0][2]
++
++# --- 中継ページ ---
++c, h, t = jump(u1, s1)
++ok('署名が合えば中継ページが出る (200)', c == 200 and '外部サイトへ移動します' in t)
++ok('移動先のホスト名を強調表示', '<div class="host">example.com</div>' in t)
++ok('URL 全体を文字で表示', f'<div class="url">{html.escape(U1, quote=True)}</div>' in t)
++ok('「進む」は元の URL へのリンク (rel/referrer 付き)', f'<a class="go" href="{html.escape(U1, quote=True)}" rel="noopener noreferrer nofollow" referrerpolicy="no-referrer">進む</a>' in t)
++ok('自動転送しない (Location も meta refresh も無い)', 'Location' not in h and 'http-equiv="refresh"' not in t.lower())
++ok('noindex / no-referrer / no-store', 'noindex' in h.get('X-Robots-Tag', '') and h.get('Referrer-Policy') == 'no-referrer' and 'no-store' in h.get('Cache-Control', ''))
++nonce = re.search(r"script-src 'nonce-([0-9a-f]+)'", h.get('Content-Security-Policy', ''))
++ok('CSP: nonce つきスクリプトだけ許可、他のサイトに埋め込めない', bool(nonce) and f'nonce="{nonce.group(1)}"' in t and "frame-ancestors 'none'" in h['Content-Security-Policy'] and "default-src 'none'" in h['Content-Security-Policy'])
++ok('xn-- のホストには注意を出す', 'xn--' in jump(links[1][1], links[1][2])[2] and 'warn' in jump(links[1][1], links[1][2])[2])
++ok('広告枠は ad.html が無ければ出ない', '<iframe' not in t)
++
++# --- 改ざん・不正な入力は、どれも「進む」を出さない ---
++def refused(label, c_t):
++    c, h, t = c_t
++    ok(label, 'class="go"' not in t and 'このリンクは使えません' in t, f'http {c}')
++s_bad = s1[:-1] + ('A' if s1[-1] != 'A' else 'B')
++refused('署名を1文字変える', jump(u1, s_bad))
++refused('URL を別のものに変えて、元の署名を使う', jump(b64u('https://evil.example/'), s1))
++refused('署名なし', get('/jump.cgi?' + q(u=u1)))
++refused('パラメータなし', get('/jump.cgi'))
++refused('署名が短い', jump(u1, s1[:10]))
++refused('u が壊れた base64', jump('!!!!', s1))
++refused('u が長すぎる', jump('A' * 3500, s1))
++refused('配列で渡す (u[]=)', get('/jump.cgi?u[]=' + u1 + '&s[]=' + s1))
++refused('javascript: (署名なし)', jump(b64u('javascript:alert(1)'), 'A' * 22))
++t = jump(b64u('https://a.com/"><script>alert(1)</script>'), 'A' * 22)[2]
++ok('壊れた URL は画面に出さない (XSS にならない)', '<script>alert(1)' not in t and 'このリンクは使えません' in t)
++random.seed(1); fz = 0
++for i in range(150):
++    uu = b64u(random.choice(['https://a.com/', 'http://b.example/x?y=1', 'https://c.example/' + str(i)]))
++    ss = ''.join(random.choice('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-') for _ in range(22))
++    if 'class="go"' in jump(uu, ss)[2]: fz += 1
++ok('ランダムな署名150件は、どれも通らない (踏み台にならない)', fz == 0, f'{fz}件が通った')
++
++# --- 署名の鍵を失った場合: 古いリンクは開かず、URL を文字で見せるだけ ---
++sec = f'{PH}/jump_secret.txt'; shutil.copy(sec, sec + '.bak'); os.unlink(sec)
++c, h, t = jump(u1, s1)
++ok('鍵を作り直されると古いリンクは「進む」を出さない', 'class="go"' not in t and '署名が合わない' in t)
++ok('その場合も URL は文字で見せる (クリックできるリンクにはしない)', html.escape(U1, quote=True) in t and f'href="{html.escape(U1, quote=True)}"' not in t)
++os.unlink(sec); shutil.move(sec + '.bak', sec)
++ok('鍵を戻せば、また開ける', 'class="go"' in jump(u1, s1)[2])
++
++# --- 広告枠 (ad.html があるときだけ。同じオリジンとして扱わない iframe) ---
++open(f'{PH}/ad.html', 'w', encoding='utf-8').write('<html><body>ad placeholder</body></html>')
++t = jump(u1, s1)[2]
++m = re.search(r'<iframe [^>]*>', t)
++ok('ad.html があれば iframe が出る (sandbox、allow-same-origin なし、広告ラベル)', bool(m) and 'sandbox="allow-scripts allow-popups"' in m.group(0) and 'allow-same-origin' not in m.group(0) and '<small>広告</small>' in t)
++ok('ad.html は配信される', get('/ad.html')[0] == 200)
++os.unlink(f'{PH}/ad.html')
++ok('ad.html を消せば、iframe は出ない・404', '<iframe' not in jump(u1, s1)[2] and get('/ad.html')[0] == 404)
++
++# --- 周辺: res_view / index / 配信 / 二重投稿 ---
++c, h, t = get('/amezo.cgi', q(folder='adm', res=T, sub='x', **{'from': 1}))
++ok('レス表示 (res_view) では、中継リンクの相対パスが jump.cgi になる', 'href="jump.cgi?u=' in t and '../jump.cgi' not in t)
++r = re.search(r'href="(jump\.cgi\?[^"]+)"', t).group(1)
++ok('レス表示のリンクから、中継ページが開く', 'class="go"' in get('/' + html.unescape(r))[2])
++idx = open(f'{PH}/adm/index.html', encoding='utf-8').read()
++ok('板の index でも中継リンク (../jump.cgi)', '../jump.cgi?u=' in idx)
++for path, want in [('/jump_secret.txt', 404), ('/jump.php', 200), ('/jump.cgi', 200)]:
++    ok(f'{path} -> {want}', get(path)[0] == want)
++c1 = post(T, 'dup', f'同じ {U1}'); c2 = post(T, 'dup', f'同じ {U1}')
++ok('同じ URL を含む本文の二重投稿を、これまでどおり検知する', c1 == (303, '') and c2 == (200, '二重カキコです.'), str(c2))
++print(f'NG の数: {bad}'); sys.exit(1 if bad else 0)
+diff --git a/tests/unit.php b/tests/unit.php
+index 236a5f1..b4fc0c4 100644
+--- a/tests/unit.php
++++ b/tests/unit.php
+@@ -100,5 +100,70 @@ chk('失効済みをもう一度失効は false', key_revoke($kd, $id1), false,
+ chk('存在しない ID の失効は false', key_revoke($kd, 'ZZZZ'), false, 'none');
+ chk('別のキーは失効の影響を受けない', key_verify($kd, '456', (string)$k2), true, 'other');
+ foreach (glob("$kd/*") as $f) unlink($f); rmdir($kd); rmdir($kd . '_b');
++// ---- URL のリンク化 (入力 -> 期待) ----
++$A = ' target="_blank" rel="noopener noreferrer nofollow"';
++$lk = static fn(string $href, string $dsp = null): string => '<a href="' . $href . '"' . $A . '>' . ($dsp ?? $href) . '</a>';
++$urlcases = [
++    ['http://example.com見てね',                    $lk('http://example.com') . '見てね'],
++    ['http://example.com. 次',                      $lk('http://example.com') . '. 次'],
++    ['<http://example.com>',                        '&lt;' . $lk('http://example.com') . '&gt;'],
++    ['"http://example.com"',                        '&quot;' . $lk('http://example.com') . '&quot;'],
++    ["'https://a.com/x'",                           '&#39;' . $lk('https://a.com/x') . '&#39;'],
++    ['https://en.wikipedia.org/wiki/PHP_(language)', $lk('https://en.wikipedia.org/wiki/PHP_(language)')],
++    ['https://ja.wikipedia.org/wiki/PHP_(言語)',     $lk('https://ja.wikipedia.org/wiki/PHP_') . '(言語)'],
++    ['(https://a.com/x)',                           '(' . $lk('https://a.com/x') . ')'],
++    ['https://a.com/x),',                           $lk('https://a.com/x') . '),'],
++    ['[https://a.com/x]',                           '[' . $lk('https://a.com/x') . ']'],
++    ['https://[::1]/x',                             $lk('https://[::1]/x')],
++    ["https://a.com/it's",                          $lk('https://a.com/it&#39;s')],
++    ['see https://a.com/?x=1&y=2 ok',               'see ' . $lk('https://a.com/?x=1&amp;y=2') . ' ok'],
++    ['https://example.com/%E6%97%A5%E6%9C%AC',      $lk('https://example.com/%E6%97%A5%E6%9C%AC')],
++    ['a http://x.com b https://y.com/z!',           'a ' . $lk('http://x.com') . ' b ' . $lk('https://y.com/z') . '!'],
++    ['http:evil',                                   'http:evil'],
++    ['javascript:alert(1)',                         'javascript:alert(1)'],
++    ['https://',                                    'https://'],
++    ['http://',                                     'http://'],
++    ['https://-bad.com',                            'https://-bad.com'],
++    ['ftp://a.com/x',                               'ftp://a.com/x'],
++    ['http://a.com&gt;x',                           $lk('http://a.com&amp;gt;x')],
++];
++foreach ($urlcases as [$in, $want]) chk('URL: ' . $in, linkify_urls(html_escape($in), false), $want, $in);
++chk('URL: <br> で止まる', linkify_urls('http://x.com<br>next', false), $lk('http://x.com') . '<br>next', 'br');
++$evil = linkify_urls(html_escape('https://a.com/x," onmouseover="alert(1)'), false);
++chk('URL: 属性を抜け出せない', (bool)preg_match('/<[^>]*onmouseover/', $evil), false, $evil);
++chk('URL: 長い URL (400文字) も最後まで', linkify_urls(html_escape('https://a.com/' . str_repeat('a', 386)), false), $lk('https://a.com/' . str_repeat('a', 386)), 'long');
++$t0 = microtime(true); linkify_urls(html_escape(str_repeat('http://a.com/((((((((', 40)));
++chk('URL: 悪意のある入力でも遅くならない (50ms以内)', microtime(true) - $t0 < 0.05, true, 'redos');
++// ---- 中継ページ (jump) ----
++foreach (['https://a.com/x?y=1&z=2', "https://a.com/it's", 'https://[::1]/x', 'http://a.com'] as $u) chk("url_is_valid ok: $u", url_is_valid($u), true, $u);
++foreach (['', 'javascript:alert(1)', 'http://', 'https://-a.com', "https://a.com/ x", 'https://a.com/"', 'https://a.com/<b>', "https://a.com/\n", 'ftp://a.com',
++          'https://a.com/' . str_repeat('a', 2100), "https://a.com/\x00", 'https://a.com/日本'] as $u) chk('url_is_valid 不可: ' . substr(json_encode($u), 0, 30), url_is_valid($u), false, $u);
++chk('b64url 往復', b64url_decode(b64url_encode("https://a.com/?x=1&y=日")), "https://a.com/?x=1&y=日", 'rt');
++foreach (['', 'a b', 'ab=', '+/', 'ab!', "ab\n"] as $bad) chk('b64url_decode 拒否: ' . json_encode($bad), b64url_decode($bad), null, $bad);
++$u0 = 'https://a.com/?x=1&y=2';
++$sig = jump_sign($u0);
++chk('署名は22文字 (base64url)', (bool)preg_match('/^[A-Za-z0-9_-]{22}$/', $sig), true, $sig);
++chk('署名は同じ URL なら同じ', jump_sign($u0), $sig, 'det');
++chk('署名は URL が違えば違う', jump_sign($u0 . 'x') !== $sig, true, 'diff');
++chk('署名の検証', jump_verify($u0, $sig), true, 'verify');
++chk('URL を変えると通らない', jump_verify($u0 . 'x', $sig), false, 'tamper url');
++$sig2 = $sig; $sig2[21] = $sig2[21] === 'A' ? 'B' : 'A';
++chk('署名を1文字変えると通らない', jump_verify($u0, $sig2), false, 'tamper sig');
++chk('署名が空・短いと通らない', jump_verify($u0, '') || jump_verify($u0, substr($sig, 0, 10)), false, 'short');
++chk('署名が合っても、URL として不正なら通らない', jump_verify('javascript:alert(1)', jump_sign('javascript:alert(1)')), false, 'js');
++chk('中継の秘密鍵は、トリップ・ID・キーとは別のファイル', count(array_unique([file_get_contents(JUMP_SECRET_FILE), file_get_contents(TRIP_SECRET_FILE), file_get_contents(ID_SECRET_FILE)])), 3, 'keys');
++$out = linkify_urls(html_escape('see https://a.com/?x=1&y=2 ok'), true);
++preg_match('/href="([^"]+)"/', $out, $hm);
++parse_str((string)parse_url(html_entity_decode($hm[1]), PHP_URL_QUERY), $q);
++chk('中継リンク: href は ../jump.cgi', str_starts_with($hm[1], '../jump.cgi?u='), true, $hm[1]);
++chk('中継リンク: 直リンクが href に入っていない', str_contains($hm[1], 'a.com'), false, $hm[1]);
++chk('中継リンク: u を戻すと元の URL', b64url_decode($q['u'] ?? ''), 'https://a.com/?x=1&y=2', 'u');
++chk('中継リンク: 署名が合う', jump_verify((string)b64url_decode($q['u'] ?? ''), $q['s'] ?? ''), true, 's');
++chk('中継リンク: 表示する文字は元の URL', str_contains($out, '>https://a.com/?x=1&amp;y=2</a>'), true, $out);
++chk('中継リンク: target/rel が付く', str_contains($out, 'target="_blank" rel="noopener noreferrer nofollow"'), true, 'rel');
++chk('中継リンク: 同じ本文は同じ出力 (二重投稿の判定が効く)', linkify_urls(html_escape('x https://a.com/b'), true), linkify_urls(html_escape('x https://a.com/b'), true), 'same');
++chk('中継リンク: 直リンク指定 (false) は元の形', str_contains(linkify_urls('https://a.com/x', false), 'href="https://a.com/x"'), true, 'direct');
++$evil2 = linkify_urls(html_escape('https://a.com/x," onmouseover="alert(1)'), true);
++chk('中継リンク: 属性を抜け出せない', (bool)preg_match('/<[^>]*onmouseover/', $evil2), false, $evil2);
+ echo "$n checks, $fail failed\n";
+ exit($fail ? 1 : 0);
+diff --git a/tests/webshell_test.py b/tests/webshell_test.py
+new file mode 100644
+index 0000000..0534a74
+--- /dev/null
++++ b/tests/webshell_test.py
+@@ -0,0 +1,55 @@
++# webshell 対策の回帰テスト: 「実行できる形の PHP を置かれた」と仮定して、配信の入口 (router.php) が実行しないことを確かめる。
++# 前提: /tmp/phpt に PHP 版一式、http://127.0.0.1:8123 で router.php を起動 (板 adm がある)
++import http.client, os, sys
++PH, HOST, PORT = '/tmp/phpt', '127.0.0.1', 8123
++bad = 0
++def ok(label, cond, extra=''):
++    global bad
++    if not cond: bad += 1
++    print(('OK   ' if cond else 'NG   ') + label + (('  ' + extra) if extra else ''))
++def raw(target, method='GET', body=None):
++    c = http.client.HTTPConnection(HOST, PORT, timeout=10)
++    try:
++        c.putrequest(method, target, skip_host=False, skip_accept_encoding=True)
++        c.putheader('CF-Connecting-IP', '9.8.7.6')
++        c.endheaders()
++        r = c.getresponse(); return r.status, r.read().decode('utf-8', 'replace')
++    except Exception as e:
++        return 0, str(e)
++    finally:
++        c.close()
++CODE = '<?php echo "EXEC-RESULT:" . (1+1); ?>\n'      # 実行されると "EXEC-RESULT:2" が出る。文字のまま返れば '<?php' が見える
++plant = [f'{PH}/probe_root.php', f'{PH}/probe_root.phtml', f'{PH}/adm/shell.php', f'{PH}/adm/shell.phtml', f'{PH}/adm/shell.php5',
++         f'{PH}/adm/shell.phar', f'{PH}/adm/.htaccess', f'{PH}/adm/999999999999.html', f'{PH}/adm/index99.html', f'{PH}/adm/o111.html']
++for p in plant: open(p, 'w').write(CODE)
++SECRET = f'{PH}/probe_secret.txt'; MARK = 'SECRET-MARKER-9'
++open(SECRET, 'w').write(MARK + '\n')      # アプリのフォルダ直下の秘密ファイル (delpass.txt や *_secret.txt の代わり)
++try:
++    # --- 1. 実行されてはいけない経路 (404 か 400 で、実行結果が出ない) ---
++    deny = ['/probe_root.php', '//probe_root.php', '///probe_root.php', '//./probe_root.php', '//probe_root.php?x=1', '//probe_root.phtml',
++            '/%70robe_root.php', '/probe_root.php%00.html', '/adm/%2e%2e/probe_root.php', '/adm/..%2fprobe_root.php', '/adm/../probe_root.php',
++            '/adm/shell.php', '/adm/shell.phtml', '/adm/shell.php5', '/adm/shell.phar', '/adm/.htaccess', '/adm//shell.php', '//adm/shell.php',
++            '/amezo.cgi/probe_root.php', '/amezo.php/x', '/adm/shell.php/amezo.cgi', '/./probe_root.php', '\\probe_root.php',
++            '//lib.php', '//router.php', '//config.php', '//admin.php/x', '/lib.php', '/config.php', '/tests/unit.php', '/jump_secret.txt', '/adm/keys.txt',
++            'http://127.0.0.1:8123/probe_root.php', 'http://127.0.0.1:8123//probe_root.php',
++            '/probe_secret.txt', '//probe_secret.txt', '///probe_secret.txt', '//probe_secret.txt?x=1', 'http://127.0.0.1:8123//probe_secret.txt',
++            '//delpass.txt', '//trip_secret.txt', '//id_secret.txt', '//key_secret.txt', '//jump_secret.txt', '//cap.txt', '//ng.txt', '//blist.txt']
++    for t in deny:
++        c, b = raw(t)
++        allowed = (400, 404) + ((0,) if t.startswith('\\') else ())     # '\\' で始まるのは HTTP として不正。サーバーが接続を切ってもよい (実行されなければよい)
++        ok(f'実行・配信されない: {t}', 'EXEC-RESULT:2' not in b and MARK not in b and c in allowed, f'HTTP {c}')
++    # --- 2. 許可リストの静的ファイルは、中身が PHP でも文字のまま返る (実行されない) ---
++    for t in ['/adm/999999999999.html', '/adm/index99.html', '/adm/o111.html']:
++        c, b = raw(t)
++        ok(f'静的 .html は文字のまま: {t}', c == 200 and b.startswith('<?php') and 'EXEC-RESULT:2' not in b, f'HTTP {c}')
++    # --- 3. 本来の経路は、これまでどおり動く ---
++    for t, want in [('/', 200), ('/style.css', 200), ('/hide.js', 200), ('/dai.cgi', 200), ('/jump.cgi', 200), ('/jump.php', 200),
++                    ('/amezo.cgi?folder=adm', 303), ('/amezo.cgi?folder=adm&page=2', 303), ('/admin.cgi', 200), ('/adm/', 200), ('/adm', 301),
++                    ('/jump.cgi?u=aHR0cHM6Ly9hLmNvbS8&s=AAAAAAAAAAAAAAAAAAAAAA', 200), ('/adm/index.html', 200)]:
++        c, b = raw(t)
++        ok(f'通常の経路: {t}', c == want, f'HTTP {c}')
++finally:
++    for p in plant + [SECRET]:
++        try: os.unlink(p)
++        except OSError: pass
++print(f'NG の数: {bad}'); sys.exit(1 if bad else 0)

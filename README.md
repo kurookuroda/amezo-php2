@@ -9,6 +9,7 @@ Python 版 (`amezo.py` / `dai.py`) の PHP 移植。スレッドは今までど�
 | `lib.php` | 共通部品 (エスケープ、文字数、鍵、トリップ、ID、ハッシュ、index 再生成、過去ログ) |
 | `amezo.php` | 投稿の受付 (`/amezo.cgi` もここに向く) |
 | `dai.php` | 板一覧 (`/dai.cgi` もここに向く) |
+| `jump.php` | 外部サイトへの中継ページ (`/jump.cgi` もここに向く)。署名つきの URL だけを表示する |
 | `admin.php` | 管理画面 (`/admin.cgi` もここに向く): レス削除、スレッドの非表示・復元 |
 | `router.php` | `php -S` 用。許可リスト方式で静的ファイルを配る |
 | `hide.js` | ID / トリップの非表示 (ブラウザの localStorage だけで動く) |
@@ -63,6 +64,48 @@ sh run.sh                 # http://127.0.0.1:8000/
 - 文字列の連結 (`.=`) を配列 + `implode` に変えても、メモリは減らない (20万片で 9.0MB → 16.0MB)。`regen_index` は文字列に溜めず、`fwrite` で書き出している。
 - cloudflared のメモリは測っていない。
 
+## セキュリティ (webshell 対策)
+
+webshell = 攻撃者が置いた(または書き込ませた) PHP を、あとから実行される形で残すこと。このアプリでは、次の層で防いでいる。
+
+**1. 置かせない (入口)**
+- ファイルのアップロード機能が無い。`eval` `system` `exec` `unserialize` `include` (変数のパス) など、コード実行につながる関数をアプリ本体で使っていない (走査で確認)。
+- ファイルを書く・消す・名前を変える操作のパスは、`blist.txt` に載っている板名、数字だけのスレッド番号、定数だけから作る。攻撃者が名前を選べる書き込みは無い。
+- 投稿の全フィールド (名前・メール・題名・本文) は、保存前にエスケープする。`<?php` `<?=` `<%` `<script language="php">` は文字になる (`.html` を PHP として処理する設定ミスがあっても実行されない)。
+
+**2. 置かれても実行させない・秘密を配らない (配信の入口: `router.php`)**
+- 実行するのは `/amezo` `/dai` `/admin` `/jump` の `.cgi` / `.php` だけ。静的ファイルは許可リスト (`index.html` `数字.html` `o数字.html` `kako.html` `style.css` `hide.js` `ad.html`) だけ。ほかは 404。
+- 板フォルダに `shell.php` `.phtml` `.php5` `.phar` `.htaccess` を置かれても 404。許可リストの `.html` に PHP のコードが入っていても、文字のまま返る (実行されない)。
+- **`//` で許可リストをすり抜けられる不具合を直した (旧 router)**: `parse_url('//delpass.txt')` は「ホスト名 delpass.txt」と読んでパスが null になり、router は `/` (許可リスト内) と判断して `return false` するのに、
+  組み込みサーバーは生の `//delpass.txt` を実際のファイルとして開いていた。**アプリのフォルダ直下の全部のファイルが対象だった**: `delpass.txt`、`trip_secret.txt` `id_secret.txt` `key_secret.txt` `jump_secret.txt`、`cap.txt` `ng.txt` `blist.txt` などがそのまま読め、`.php` は実行もされた
+  (板フォルダの中 (`//adm/keys.txt` など) は影響なし)。旧 router を、外から届く形で動かしていたなら、これらを読まれた可能性がある。管理用パスワード・キャップのパスワード・各 `*_secret.txt` を作り直すこと (作り直すと、トリップ・ID・中継リンク・発行済みの認証キーは変わる、または使えなくなる)。
+  いまは `parse_url` を使わず、`//`、`%`、`\`、`.` `..` の区間、NUL、`/` で始まらない形 (`http://…`) を 400 で止める。本来の経路は、どれもこれらを使わない。
+  `tests/webshell_test.py` が、この種の経路と、秘密ファイル (`//delpass.txt` `//trip_secret.txt` など) を毎回確かめる。
+- `%` を含むパスは 400 になる。**板のフォルダ名は ASCII にすること** (非 ASCII の名前は、ブラウザが `%E6…` に変換するため開けなくなる)。板のタイトル (`blist.txt` の3列目) は日本語でよい。
+
+**3. 実行されても被害を小さくする (PHP の起動オプション)**
+`php -S` の起動に、次を付けても、サーバーを使う結合テスト (`jump_test.py` `lock_test.py` `webshell_test.py`) が通ることを確認した。コードを実行できた攻撃者が、コマンド実行・外への接続・アプリの外のファイルの読み書きをできなくなる。
+
+```
+php -n -d extension=<mbstring.so> -d extension=<ctype.so> -d memory_limit=32M -d expose_php=0 \
+    -d allow_url_fopen=0 -d allow_url_include=0 -d open_basedir=<アプリのフォルダ>:/tmp \
+    -d disable_functions=exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec,dl,mail,show_source,highlight_file,phpinfo,\
+posix_kill,posix_setuid,posix_setgid,posix_mkfifo,symlink,link,putenv,fsockopen,pfsockopen,stream_socket_client,\
+stream_socket_server,stream_socket_pair,socket_create,socket_create_listen,curl_exec,curl_multi_exec,proc_nice,proc_terminate,proc_get_status \
+    -S 127.0.0.1:8000 router.php
+```
+
+(`setup_expose.py` の既定にはまだ入れていない。`setup_expose.py` が PHP を起動するのは Python の `subprocess` なので、`disable_functions` の影響は受けない。)
+
+**4. 見つける・気づく**
+- 板フォルダに置かれるファイル名は決まっている (`数字.html`、`x数字.html`、`o数字.html`、`数字.lock`、`index数字.html`、`kako.html`、`kako.txt`、`keys.txt`、`keys.lock`、`lasttime.txt`、`regen.lock`)。これ以外のファイルがあれば異常。
+  板の `.html` / `.txt` に生の `<?` や `<%` があれば異常 (エスケープ済みなので、正常なら入らない)。コードのハッシュを控えておけば、書き換えも分かる。
+
+**まだ弱いところ**
+- `lib.php` は、`config.php` があれば自動で `require` する。アプリのフォルダは PHP が書き込める場所なので、将来、書き込みの穴が見つかったときに、そのまま常駐の足がかりになる。設定を PHP ファイルでなく、実行されない形式 (ini / JSON) にするのが望ましい。
+- Colab では PHP が root で動き、コードと同じフォルダに鍵やデータが書かれる。コードを読み取り専用にする、データのフォルダを分ける、非 root で動かす、Google ドライブを同じランタイムにマウントしない、が望ましい。
+- `setup_expose.py` が取得する `cloudflared` は、チェックサムを確かめていない。
+
 ## 設定
 
 `config.php` (任意。`.gitignore` 済み) に `define('POST_INTERVAL', 3);` のように書くと、`lib.php` 冒頭の既定値を上書きできる。
@@ -84,6 +127,27 @@ php amezo.php --make-hash 'パスワード' > delpass.txt     # 管理用パス�
 - 非表示は `x数字.html` にリネーム (権限 0600、配信されない)。復元で戻せる。
 - レス一覧に ID の列を足してある (荒らしの見分け用)。
 - スレッドごとの鍵 (認証キー) の管理は、次の「鍵つきスレッド」を参照。
+
+## 外部リンクの中継ページ
+
+投稿された URL は、直接ではなく中継ページを経由するリンクになる。「このリンク先へ行きますか?」と確認させるためのページで、広告枠を置ける。
+
+```
+スレッド HTML:  <a href="../jump.cgi?u=<URL (base64url)>&s=<署名>">元の URL の文字</a>
+  → 中継ページ: 移動先のホスト名 + URL 全体を文字で表示 + 「進む」「戻る」(自動では転送しない)
+  → 「進む」を押したときだけ、外部サイトへ
+```
+
+- **署名つき**: `s` は `HMAC-SHA256(jump_secret.txt の鍵, 'jump:' + URL)` の先頭132bit。署名が合うもの (= この掲示板に実際に投稿された URL) だけを表示する。
+  署名がなければ「どんな URL へも飛ばせる踏み台」になり、フィッシングに使われる。`u` や `s` を1文字変えても、別の URL に替えても、ランダムな署名でも通らない (テストで確認)。
+- **署名の鍵は、作り直さない**: `jump_secret.txt` を失うと、投稿済みの中継リンクが全部開けなくなる (トリップや ID の鍵より重い)。バックアップに入れること。
+  署名が合わないときは、「進む」を出さず、URL を文字だけで見せる (クリックできるリンクにはしない)。
+- **中継ページの安全対策**: `http` / `https` で、ホスト名が英数字で始まる ASCII の URL だけ (2000文字まで)。`xn--` を含むドメインには注意を出す。
+  `noindex`、`no-referrer`、`no-store`、CSP (nonce つきのスクリプトだけ、他サイトに埋め込めない)。
+- **広告枠**: `ad.html` を置くと、中継ページに「広告」ラベルつきの iframe で出る。`sandbox="allow-scripts allow-popups"` (`allow-same-origin` なし) なので、広告のコードは掲示板のデータに触れない。
+  `ad.html` が無ければ何も出ない。広告サービスの規約 (中継ページへの設置など) は、使う前に確認すること。
+- 直リンクに戻すときは、`config.php` に `define('JUMP_ENABLED', false);`。
+- 既存のスレッド (中継を入れる前の投稿) の直リンクは、書き換えていない。
 
 ## 鍵つきスレッド (認証キー)
 
@@ -126,6 +190,10 @@ php amezo.php --make-hash 'パスワード' > delpass.txt     # 管理用パス�
   - リンクは `amezo.cgi?folder=板&page=3` (GET)。押すと、そのページのファイルが新しければそのまま、古ければ (10秒) 作り直して `index3.html` へ転送する。範囲外の番号は最後のページになる。
   - 同じページは誰が頼んでも同じ内容なので、共有の `index2.html` のような上書きの取り違えは起きない。フォーム送信ではないので「再送信しますか」も出ない。10分たったファイルは掃除する。
   - 「◯番目から」の細かい位置指定はできない (20件区切り)。古い index に残っている `next=N` の欄は、そのページに読み替えて受ける。
+- **投稿された URL は、署名つきの中継ページ (`/jump.cgi`) 経由のリンクになる** (下の「外部リンクの中継ページ」)。新規の投稿だけが対象で、既存のスレッドの直リンクはそのまま。
+- 本文の URL のリンク化 (`linkify_urls()`) を作り直した。URL とみなすのは、`http://` か `https://` で始まり、ホスト名が英数字で始まり、URL に使える **ASCII の文字だけ** (と、エスケープされた `&amp;` `&#39;`)。
+  直後の日本語 (`http://example.com見てね`)、`<…>` や `"…"` の閉じ側、末尾の `.` `,` `!` `?`、対応のない `)` `]`、末尾の `(` は URL に含めない。`http:evil` や `javascript:` はリンクにしない。
+  href はエスケープを戻してから属性用にエスケープし直す (`&` は `&amp;`)。デコード済みの日本語を含む URL (`/wiki/PHP_(言語)` など) は、最初の日本語で切れる (アドレスバーからコピーした `%E6…` の形ならそのまま通る)。
 - `AMEZO-NEXT` のコメントは出さない。
 - 投稿行に `data-id` / `data-trip` と `ID:xxxxxxxx` が入る。新しいスレッドと index には `hide.js` を読む `<script>` が入る (既存スレッドには入らない)。
 - スレッドの末尾だけを読むので、レス数が増えても投稿・再生成のメモリは増えない。管理画面も1行ずつ読んで出す (5000レスのスレッドでも `memory_limit=3M` で動く)。
@@ -133,8 +201,10 @@ php amezo.php --make-hash 'パスワード' > delpass.txt     # 管理用パス�
 
 ## 検証した内容
 
-- `tests/unit.php`: Python 版が出した値 (トリップ、文字数、切り詰め、エスケープ、不可視文字、pbkdf2 ハッシュ) と、ID・ページ送り・認証キー (生成、正規化、範囲、失効) を合わせた 147 項目が一致。
+- `tests/unit.php`: Python 版が出した値 (トリップ、文字数、切り詰め、エスケープ、不可視文字、pbkdf2 ハッシュ) と、ID・ページ送り・認証キー (生成、正規化、範囲、失効)・URL のリンク化 (26通り)・中継リンクの署名 (改ざん、往復、秘密鍵の分離) を合わせた項目が、すべて一致 (件数は実行結果の末尾に出る)。
 - `tests/e2e.sh` + `tests/cmp.py`: 同じ投稿 25 通りを Python 版と PHP 版に流し、エラー文言と生成 HTML (スレッド・index・過去ログ) が一致 (日時・ID・番号などは正規化)。
+- `tests/webshell_test.py`: 実行できる形の PHP や、秘密ファイルを置かれたと仮定して、`//x.php` `//delpass.txt` `%2e%2e` `\` 絶対形式などの経路が、実行・配信されない (404/400、静的 `.html` は文字のまま) こと、本来の経路が動くことを確認。
+- `tests/jump_test.py`: 中継ページ (リンクの形、署名の検証、改ざん・ランダムな署名・壊れた入力が通らないこと、鍵を失った場合、広告枠、`res_view` の相対パス、配信) を確認。
 - `tests/lock_test.py` と `tests/lock_retire.php`: 鍵つきスレッド (鍵をかける前後の発行、書き込みの可否、範囲、失効、鍵を外す、フォームの差し替え、配信されないこと、同時のかけ外し、退避時の `.lock`) を確認。
 - `tests/pager.sh` と `tests/unit.php`: ページ送り (実在するページだけ、範囲外は最後のページ、前へ/次への出し分け、1ページの板では出さない、11ページ以上の省略表示、ファイル数) を確認。
 - 同時投稿 60 件 → 61 レスが欠けずに連番、返信フォームは1つ。
@@ -145,6 +215,7 @@ php amezo.php --make-hash 'パスワード' > delpass.txt     # 管理用パス�
 
 ## まだ無いもの / 未確認
 
+- 既存スレッドの直リンクを中継リンクに書き換える処理 (サーバー側の一括スクリプト。ブラウザ側では署名が作れないので不可)。広告の中身。
 - 鍵つきスレッドで、スレを立てた人が自分でキーを発行する機能 (今は管理者だけ)。書き込みにキーのラベルを表示する機能。
 - 既存スレッドに `hide.js` を入れる処理 (新しいスレッドと index にだけ入る)。
 - `>>数字` のアンカーと連鎖あぼーん (今は `>>` を `>` に畳む仕様)。

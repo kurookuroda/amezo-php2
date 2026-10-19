@@ -37,6 +37,7 @@ foreach ([
     'COMM_LINES_MAX'  => 20,
     'HASH_ITERATIONS' => 100000,
     'TRUSTED_PROXIES' => ['127.0.0.1', '::1'],
+    'JUMP_ENABLED'    => true,     // 投稿の URL を、署名つきの中継ページ (jump.cgi) 経由のリンクにする (false なら直リンク)
 ] as $k => $v) {
     defined($k) || define($k, $v);
 }
@@ -66,6 +67,12 @@ const KEY_SECRET_FILE = 'key_secret.txt';   // キーのハッシュ用の秘密
 const KEY_CTX         = 'key:';             // 公開後に変えない
 const KEYS_FILE       = 'keys.txt';         // 板ごと: <板>/keys.txt
 const KEY_ALPHABET    = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+
+// ---- 中継ページ (jump.php): 投稿の URL への署名つきリンク ----
+const JUMP_SECRET_FILE = 'jump_secret.txt'; // 署名用の秘密鍵 (他の鍵とは別)。失うと、投稿済みの中継リンクが全部使えなくなる
+const JUMP_CTX         = 'jump:';           // 公開後に変えない
+const JUMP_SIG_LEN     = 22;                // 署名の長さ (base64url で22文字 = 132bit)
+const URL_MAX_LEN      = 2000;
 
 const SCRIPT_TAG = '<script src="../hide.js" defer></script>';
 const COPYRIGHT  = "<!--\n    Script for amezo-like BBS (PHP Version)\n    Original Copyright (C) 1999-2003 amezo_\n    http://www17.big.or.jp/~amezo_/\n    http://ame.x0.com/\n-->\n";
@@ -351,11 +358,79 @@ function redirect(string $folder, string $index_name): never
     exit;
 }
 
-function url_link(array $m): string
+function b64url_encode(string $bin): string
 {
-    $dsp = $m[1];
-    $url = str_replace('&amp;', '&', $dsp);
-    return '<a href="' . $url . '" target="_blank" rel="noopener noreferrer nofollow">' . $dsp . '</a>';
+    return rtrim(strtr(base64_encode($bin), '+/', '-_'), '=');
+}
+
+function b64url_decode(string $s): ?string
+{
+    if ($s === '' || !preg_match('/^[A-Za-z0-9_-]+$/D', $s)) return null;
+    $d = base64_decode(strtr($s, '-_', '+/'), true);
+    return $d === false ? null : $d;
+}
+
+/** 中継ページに渡してよい URL か (http/https、ホスト名は英数字か [ で始まる、使える文字は ASCII の URL 文字だけ) */
+function url_is_valid(string $url): bool
+{
+    if ($url === '' || strlen($url) > URL_MAX_LEN) return false;
+    return (bool)preg_match('/^https?:\/\/[A-Za-z0-9\[][A-Za-z0-9\-._~:\/?#\[\]@!$*+,;=%()\'&]*$/D', $url);
+}
+
+/** URL の署名: HMAC-SHA256(中継用の秘密鍵, 'jump:' + URL) の先頭132bit */
+function jump_sign(string $url): string
+{
+    return substr(b64url_encode(hash_hmac('sha256', JUMP_CTX . $url, load_secret(JUMP_SECRET_FILE), true)), 0, JUMP_SIG_LEN);
+}
+
+function jump_verify(string $url, string $sig): bool
+{
+    return url_is_valid($url) && hash_equals(jump_sign($url), $sig);
+}
+
+/** スレッド HTML に書く中継リンクの href (属性用にエスケープ済み。板のフォルダの中から見た相対パス) */
+function jump_href(string $url): string
+{
+    return '../jump.cgi?u=' . b64url_encode($url) . '&amp;s=' . jump_sign($url);
+}
+
+/**
+ * エスケープ済みの本文から URL を探して、リンクにする。
+ *  - URL に使える ASCII の文字と、エスケープされた &amp; &#39; だけを URL とみなす
+ *    (直後の日本語、&gt; &quot; などのエスケープ、<br> は URL に含めない)
+ *  - 末尾の . , ; : ! ? ( と、対応のない ) ] は URL に含めない
+ *  - http:// か https:// で始まり、ホスト名の最初が英数字 (または [ ) のものだけ
+ * $jump (既定は JUMP_ENABLED) が true なら、リンク先は署名つきの中継ページ。表示する文字は元の URL のまま。
+ * false なら直リンク。href はエスケープを戻してから属性用に正しくエスケープし直す (生の & を入れない)。
+ */
+function linkify_urls(string $escaped, ?bool $jump = null): string
+{
+    $jump ??= JUMP_ENABLED;
+    return (string)preg_replace_callback(
+        '/https?:\/\/(?:[A-Za-z0-9\-._~:\/?#\[\]@!$*+,;=%()]|&amp;|&#39;)+/',
+        static function (array $m) use ($jump): string {
+            $dsp = $m[0];
+            $tail = '';
+            while ($dsp !== '') {
+                if (str_ends_with($dsp, '&amp;') || str_ends_with($dsp, '&#39;')) {
+                    $cut = 5;
+                } else {
+                    $c = $dsp[strlen($dsp) - 1];
+                    if (str_contains('.,;:!?(', $c)) $cut = 1;
+                    elseif ($c === ')' && substr_count($dsp, ')') > substr_count($dsp, '(')) $cut = 1;
+                    elseif ($c === ']' && substr_count($dsp, ']') > substr_count($dsp, '[')) $cut = 1;
+                    else break;
+                }
+                $tail = substr($dsp, -$cut) . $tail;
+                $dsp = substr($dsp, 0, -$cut);
+            }
+            $url = str_replace(['&amp;', '&#39;'], ['&', "'"], $dsp);
+            if (!url_is_valid($url)) return $m[0];
+            $href = $jump ? jump_href($url) : html_escape($url);
+            return '<a href="' . $href . '" target="_blank" rel="noopener noreferrer nofollow">' . $dsp . '</a>' . $tail;
+        },
+        $escaped
+    );
 }
 
 /** レス用フォーム (1行で返す。スレッドファイルのパーサが行単位のため)。鍵つきスレッドは認証キーの欄が付く */
@@ -588,18 +663,19 @@ function res_view(string $folder, array $form): never
 
     header('Content-Type: text/html; charset=UTF-8');
     while (($line = fgets($fp)) !== false) {
-        echo str_replace(['href="../style.css"', 'src="../hide.js"'], ['href="style.css"', 'src="hide.js"'], $line);
+        echo str_replace(['href="../style.css"', 'src="../hide.js"', 'href="../jump.cgi?'], ['href="style.css"', 'src="hide.js"', 'href="jump.cgi?'], $line);
         if (str_contains($line, '<dl>') || str_contains($line, '<dt>')) break;
     }
     $fol_tag = '<input type="hidden" name="folder" value="' . htmlspecialchars($folder, ENT_QUOTES, 'UTF-8') . '">';
     // 返信フォームの行は、action を板のない位置に直し、folder を足して出す
     $form_line = static fn(string $l): string => str_replace('</form>', $fol_tag . '</form>', str_replace('action="../', 'action="', $l));
+    $fixj = static fn(string $l): string => str_contains($l, '../jump.cgi?') ? str_replace('href="../jump.cgi?', 'href="jump.cgi?', $l) : $l;   // / 直下から出力するので、中継リンクの相対パスを直す
     $matched = false;
     $footer = null;
     while (($line = fgets($fp)) !== false) {
         if (str_starts_with($line, '<form')) $footer = $line;
         if (preg_match('/<dt>(\d+)/', $line, $m) && (int)$m[1] >= $from) {
-            echo $line;
+            echo $fixj($line);
             $matched = true;
             break;
         }
@@ -608,7 +684,7 @@ function res_view(string $folder, array $form): never
         echo $form_line($footer);
     }
     while (($line = fgets($fp)) !== false) {
-        echo str_contains($line, '</form>') ? $form_line($line) : $line;
+        echo str_contains($line, '</form>') ? $form_line($line) : $fixj($line);
     }
     fclose($fp);
     exit;
